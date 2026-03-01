@@ -1,0 +1,616 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Checkbook</title>
+  <style>
+    body { font-family: system-ui; margin: 16px; max-width: 900px; background:#000; color:#8fd3ff; }
+    input, button, textarea, select { font-size: 16px; padding: 10px; background:#111; color:#8fd3ff; border:1px solid #8fd3ff; }
+    button:hover { background:#8fd3ff; color:#000; cursor:pointer; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom: 10px; }
+    textarea { width: 100%; min-height: 80px; }
+    #total { font-weight: 800; margin: 14px 0; }
+    #listWrap { margin-top: 10px; border: 1px solid #8fd3ff; max-height: 420px; overflow-y: auto; padding: 10px; }
+    ul { padding-left: 18px; margin: 0; }
+    li.txn { display:flex; justify-content: space-between; gap: 10px; padding: 6px 0; }
+    .actions { display:flex; gap: 8px; }
+    a { color:#8fd3ff; }
+
+    .form-vertical { display: flex; flex-direction: column; gap: 10px; max-width: 560px; }
+    .form-vertical label { font-size: 14px; opacity: 0.85; }
+    .form-vertical input, .form-vertical textarea, .form-vertical select { width: 100%; }
+
+    .minirow { display: flex; gap: 10px; align-items: center; }
+    .minirow > * { flex: 1; }
+    .minirow .btn { flex: 0 0 auto; white-space: nowrap; }
+
+    .pill {
+      display: inline-block;
+      border: 1px solid #8fd3ff;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 14px;
+    }
+
+    .err { color: #ff7aa2; font-weight: 700; margin-top: 8px; }
+    .muted { opacity: 0.85; font-size: 14px; }
+
+    /* --- Transaction list polish --- */
+    #listWrap { padding: 0; } /* tighter, we'll pad rows instead */
+    ul { list-style: none; padding: 0; margin: 0; }
+
+    li.txn {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(143, 211, 255, 0.25);
+    }
+
+    .txn-left { min-width: 0; } /* allow wrap */
+    .txn-topline { font-weight: 700; }
+    .txn-subline { font-size: 13px; opacity: 0.85; margin-top: 2px; }
+
+    .txn-right { display: flex; align-items: center; gap: 10px; }
+    .txn-amount { font-weight: 900; white-space: nowrap; }
+
+    .amount-pos { color: #8fd3ff; }   /* keep blue theme */
+    .amount-neg { color: #ff7aa2; }   /* soft pink/red */
+
+    .txn-total {
+      border-left: 4px solid #8fd3ff;
+      background: rgba(143, 211, 255, 0.06);
+    }
+
+    .badge {
+      display: inline-block;
+      border: 1px solid rgba(143, 211, 255, 0.6);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      margin-left: 8px;
+      opacity: 0.95;
+    }
+
+    /* --- Toast --- */
+    #msg {
+      position: fixed;
+      left: 16px;
+      right: 16px;
+      bottom: 16px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(143, 211, 255, 0.7);
+      background: rgba(17, 17, 17, 0.98);
+      color: #8fd3ff;
+      font-weight: 700;
+      max-width: 680px;
+      margin: 0 auto;
+      opacity: 0;
+      transform: translateY(10px);
+      pointer-events: none;
+      transition: opacity 180ms ease, transform 180ms ease;
+    }
+
+    #msg.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    #msg.error {
+      border-color: rgba(255, 122, 162, 0.9);
+      color: #ff7aa2;
+    }
+    #msg.ok {
+      border-color: rgba(143, 211, 255, 0.9);
+      color: #8fd3ff;
+    }
+
+  </style>
+</head>
+<body>
+  <div class="row" style="justify-content: space-between;">
+    <h2 id="title">Checkbook</h2>
+    <form method="POST" action="/logout">
+      <button type="submit">Log out</button>
+    </form>
+  </div>
+
+  <div class="form-vertical">
+    <label>Date</label>
+    <input type="date" id="date">
+
+    <label>Payment type</label>
+    <div class="minirow">
+      <select id="paySelect"></select>
+      <input id="payNew" placeholder="Add new payment type">
+      <button class="btn" id="payAdd">Add</button>
+    </div>
+
+    <label>Vendor</label>
+    <div class="minirow">
+      <select id="vendorSelect"></select>
+      <input id="vendorNew" placeholder="Add new vendor">
+      <button class="btn" id="vendorAdd">Add</button>
+    </div>
+
+    <label>Item</label>
+    <div class="minirow">
+      <select id="itemSelect"></select>
+      <input id="itemNew" placeholder="Add new item">
+      <button class="btn" id="itemAdd">Add</button>
+    </div>
+
+    <label>Amount</label>
+    <input id="amount" inputmode="decimal" placeholder="e.g. 12.34">
+
+    <label>Memo (optional)</label>
+    <textarea id="memo" placeholder="Optional note..."></textarea>
+
+    <div class="minirow" style="margin-top: 4px;">
+      <button id="addLine">Add line item</button>
+      <button id="receiptTotal">Receipt total</button>
+    </div>
+
+    <div class="minirow">
+      <span class="pill" id="receiptInfo">Receipt: 0 items — $0.00</span>
+      <span class="muted" id="receiptIdInfo"></span>
+    </div>
+
+    <div class="minirow" style="margin-top: 10px;">
+      <a href="/export.csv" title="Exports unexported rows and marks them exported">Export new CSV</a>
+      <a href="/export.csv?all=1" title="Exports everything (does not mark exported)">Export all CSV</a>
+    </div>
+
+    <div id="msg" class="err"></div>
+  </div>
+
+  <div id="total">Total: 0.00</div>
+<div id="lastReceipt" class="muted" style="margin-top:6px;">
+  Last Receipt: —
+</div>
+
+  <div id="listWrap">
+    <ul id="list"></ul>
+  </div>
+
+  <script>
+    const dateEl = document.getElementById("date");
+    const amountEl = document.getElementById("amount");
+    const memoEl = document.getElementById("memo");
+    const totalEl = document.getElementById("total");
+    const listEl = document.getElementById("list");
+    const titleEl = document.getElementById("title");
+    const msgEl = document.getElementById("msg");
+
+    const paySelect = document.getElementById("paySelect");
+    const payNew = document.getElementById("payNew");
+    const payAdd = document.getElementById("payAdd");
+
+    const vendorSelect = document.getElementById("vendorSelect");
+    const vendorNew = document.getElementById("vendorNew");
+    const vendorAdd = document.getElementById("vendorAdd");
+
+    const itemSelect = document.getElementById("itemSelect");
+    const itemNew = document.getElementById("itemNew");
+    const itemAdd = document.getElementById("itemAdd");
+
+    const receiptInfo = document.getElementById("receiptInfo");
+    const receiptIdInfo = document.getElementById("receiptIdInfo");
+
+    const addLineBtn = document.getElementById("addLine");
+    const receiptTotalBtn = document.getElementById("receiptTotal");
+
+    const lastReceiptEl = document.getElementById("lastReceipt");
+
+    function fmt2(x) { return Number(x).toFixed(2); }
+
+    let toastTimer = null;
+
+    amountEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();     // stop form behavior
+        addLineBtn.click();     // simulate button click
+      }
+    });
+
+    memoEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        addLineBtn.click();
+      }
+    });
+
+    function toast(kind, text) {
+      if (!msgEl) return;
+      msgEl.textContent = text;
+      msgEl.classList.remove("error", "ok", "show");
+      msgEl.classList.add(kind === "error" ? "error" : "ok");
+      // reflow to restart animation
+      void msgEl.offsetWidth;
+      msgEl.classList.add("show");
+
+      if (toastTimer) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        msgEl.classList.remove("show");
+      }, 2200);
+    }
+
+    function clearMsg() {
+      if (!msgEl) return;
+      msgEl.classList.remove("show");
+    }
+    function newReceiptId() {
+      // short random id, good enough for your app
+      return "r_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    }
+
+    let currentReceiptId = newReceiptId();
+    let receiptCount = 0;
+    let receiptSum = 0.0;
+
+    let lastReceiptAmount = null;
+    let lastReceiptCount = null;
+    let lastReceiptDate = null;
+    let lastReceiptVendor = null;
+
+    function updateLastReceiptUI() {
+      if (!lastReceiptEl) return;
+      if (lastReceiptAmount === null) {
+        lastReceiptEl.textContent = "Last Receipt: —";
+        return;
+      }
+      const vendorText = lastReceiptVendor ? ` — ${lastReceiptVendor}` : "";
+      lastReceiptEl.textContent =
+        `Last Receipt: $${fmt2(lastReceiptAmount)} (${lastReceiptCount} items) on ${lastReceiptDate}${vendorText}`;
+    }
+
+    function resetReceiptSession() {
+      currentReceiptId = newReceiptId();
+      receiptCount = 0;
+      receiptSum = 0.0;
+      updateReceiptUI();
+    }
+
+    function updateReceiptUI() {
+      receiptInfo.textContent = `Receipt: ${receiptCount} items — $${fmt2(receiptSum)}`;
+      receiptIdInfo.textContent = `(${currentReceiptId})`;
+    }
+
+    function optionEl(id, name, extra = {}) {
+      const opt = document.createElement("option");
+      opt.value = String(id);
+      opt.textContent = name;
+      // attach extra data (like default_amount) if provided
+      for (const [k, v] of Object.entries(extra)) opt.dataset[k] = v;
+      return opt;
+    }
+
+    async function loadPaymentTypes(selectIdToUse = null) {
+      const res = await fetch("/api/payment_types");
+      const data = await res.json();
+      paySelect.replaceChildren();
+      paySelect.appendChild(optionEl("", "-- select --"));
+      for (const it of data.items) paySelect.appendChild(optionEl(it.id, it.name));
+      if (selectIdToUse) paySelect.value = String(selectIdToUse);
+    }
+
+    async function loadVendors(selectIdToUse = null) {
+      const res = await fetch("/api/vendors");
+      const data = await res.json();
+      vendorSelect.replaceChildren();
+      vendorSelect.appendChild(optionEl("", "-- select --"));
+      for (const it of data.items) vendorSelect.appendChild(optionEl(it.id, it.name));
+      if (selectIdToUse) vendorSelect.value = String(selectIdToUse);
+      await loadItemsForVendor();
+    }
+
+    async function loadItemsForVendor(selectItemId = null) {
+      itemSelect.replaceChildren();
+      itemSelect.appendChild(optionEl("", "-- select --"));
+      const vid = vendorSelect.value;
+      if (!vid) return;
+
+      const res = await fetch(`/api/vendors/${vid}/items`);
+      const data = await res.json();
+      for (const it of data.items) {
+        itemSelect.appendChild(optionEl(it.id, it.name, { defaultAmount: it.default_amount }));
+      }
+      if (selectItemId) itemSelect.value = String(selectItemId);
+    }
+
+    async function refresh() {
+      const res = await fetch("/api/txns");
+      const data = await res.json();
+
+      if (data.username) titleEl.textContent = "Checkbook for " + data.username;
+      totalEl.textContent = "Total: " + fmt2(data.total);
+
+      listEl.replaceChildren();
+      const frag = document.createDocumentFragment();
+
+      for (const t of data.txns) {
+        const li = document.createElement("li");
+        li.className = "txn";
+        if (t.is_receipt_total) li.classList.add("txn-total");
+
+        const itemText = t.is_receipt_total ? "TOTAL" : (t.item || "(no item)");
+
+        // left block (2 lines)
+        const left = document.createElement("div");
+        left.className = "txn-left";
+
+        const top = document.createElement("div");
+        top.className = "txn-topline";
+        top.textContent = `${t.date} — ${t.vendor} — ${itemText}`;
+
+        if (t.is_receipt_total) {
+          const badge = document.createElement("span");
+          badge.className = "badge";
+          badge.textContent = "TOTAL";
+          top.appendChild(badge);
+        }
+
+        const sub = document.createElement("div");
+        sub.className = "txn-subline";
+        const memoPart = t.memo ? ` • ${t.memo}` : "";
+        sub.textContent = `${t.payment_type}${memoPart}`;
+
+        left.appendChild(top);
+        left.appendChild(sub);
+
+        // right block (amount + delete)
+        const right = document.createElement("div");
+        right.className = "txn-right";
+
+        const amt = document.createElement("div");
+        amt.className = "txn-amount";
+        const n = Number(t.amount);
+        if (Number.isFinite(n)) amt.classList.add(n < 0 ? "amount-neg" : "amount-pos");
+        amt.textContent = `$${fmt2(t.amount)}`;
+
+        const delBtn = document.createElement("button");
+        delBtn.textContent = "Delete";
+        delBtn.onclick = async () => {
+          if (!confirm("Delete this transaction?")) return;
+          const resp = await fetch(`/api/txns/${t.id}`, { method: "DELETE" });
+          if (!resp.ok) toast("error", "Delete failed");
+          refresh();
+        };
+
+        right.appendChild(amt);
+        right.appendChild(delBtn);
+
+        li.appendChild(left);
+        li.appendChild(right);
+        frag.appendChild(li);
+      }
+
+      listEl.appendChild(frag);
+    }
+
+    // -------- create helpers ----------
+    async function createPaymentType(name) {
+      const resp = await fetch("/api/payment_types", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      return await resp.json(); // {id,name}
+    }
+
+    async function createVendor(name) {
+      const resp = await fetch("/api/vendors", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      return await resp.json();
+    }
+
+    async function createItem(vendorId, name, defaultAmount) {
+      const resp = await fetch(`/api/vendors/${vendorId}/items`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, default_amount: defaultAmount })
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      return await resp.json(); // {id,name,default_amount}
+    }
+
+    // --------- event wiring ----------
+    payAdd.onclick = async (e) => {
+      e.preventDefault();
+      clearMsg();
+      const name = payNew.value.trim();
+      if (!name) return;
+
+      try {
+        const created = await createPaymentType(name);
+        payNew.value = "";
+        await loadPaymentTypes(created.id);
+        resetReceiptSession();
+      } catch (err) {
+        toast("error","Payment type add failed: " + err.message);
+      }
+    };
+
+    vendorAdd.onclick = async (e) => {
+      e.preventDefault();
+      clearMsg();
+      const name = vendorNew.value.trim();
+      if (!name) return;
+
+      try {
+        const created = await createVendor(name);
+        vendorNew.value = "";
+        await loadVendors(created.id);
+        resetReceiptSession();
+      } catch (err) {
+        toast("error","Vendor add failed: " + err.message);
+      }
+    };
+
+    itemAdd.onclick = async (e) => {
+      e.preventDefault();
+      clearMsg();
+
+      const vendorId = vendorSelect.value;
+      if (!vendorId) {
+        toast("ok","Select a vendor before adding an item.");
+        return;
+      }
+
+      const name = itemNew.value.trim();
+      const defaultAmount = amountEl.value.trim(); // use current amount as default
+      if (!name) {
+        toast("ok","Enter a new item name.");
+        return;
+      }
+      if (!defaultAmount) {
+        toast("ok","Enter an amount, then click Add to save as the item default.");
+        return;
+      }
+
+      try {
+        const created = await createItem(vendorId, name, defaultAmount);
+        itemNew.value = "";
+        await loadItemsForVendor(created.id);
+        // auto-fill amount from saved default (normalized)
+        amountEl.value = created.default_amount;
+      } catch (err) {
+        toast("error","Item add failed: " + err.message);
+      }
+    };
+
+    vendorSelect.onchange = async () => {
+      clearMsg();
+      await loadItemsForVendor();
+      resetReceiptSession();
+    };
+
+    paySelect.onchange = () => { clearMsg(); resetReceiptSession(); };
+    dateEl.onchange = () => { clearMsg(); resetReceiptSession(); };
+
+    itemSelect.onchange = () => {
+      const opt = itemSelect.selectedOptions[0];
+      if (opt && opt.dataset.defaultAmount) {
+        amountEl.value = opt.dataset.defaultAmount;
+      }
+
+      amountEl.focus();   // jump cursor to amount
+      amountEl.select();  // highlight value for quick overwrite
+    };
+
+    addLineBtn.onclick = async (e) => {
+      e.preventDefault();
+      clearMsg();
+
+      const payload = {
+        date: dateEl.value,
+        receipt_id: currentReceiptId,
+        payment_type_id: Number(paySelect.value),
+        vendor_id: Number(vendorSelect.value),
+        vendor_item_id: Number(itemSelect.value),
+        amount: amountEl.value.trim(),
+        memo: memoEl.value.trim(),
+      };
+
+      if (!payload.date || !paySelect.value || !vendorSelect.value || !itemSelect.value || !payload.amount) {
+        toast("ok","Pick payment type, vendor, item, and amount.");
+        return;
+      }
+
+      const resp = await fetch("/api/txns", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!resp.ok) {
+        toast("error","Save failed: " + await resp.text());
+        return;
+      }
+
+      receiptCount += 1;
+      receiptSum += Number(payload.amount);
+      updateReceiptUI();
+
+      amountEl.focus();
+      amountEl.select();
+
+      // clear for next line
+      memoEl.value = "";
+      // keep amount (often repeats) or clear? your call:
+      // amountEl.value = "";
+
+      refresh();
+    };
+
+    receiptTotalBtn.onclick = async (e) => {
+      e.preventDefault();
+      clearMsg();
+
+      if (!dateEl.value || !paySelect.value || !vendorSelect.value) {
+        toast("ok","Pick date, payment type, and vendor before receipt total.");
+        return;
+      }
+      if (receiptCount === 0) {
+        toast("ok","No receipt items yet.");
+        return;
+      }
+
+      const payload = {
+        date: dateEl.value,
+        receipt_id: currentReceiptId,
+        payment_type_id: Number(paySelect.value),
+        vendor_id: Number(vendorSelect.value),
+        amount: String(receiptSum),
+        item_count: receiptCount,
+      };
+
+      const resp = await fetch("/api/receipt_total", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!resp.ok) {
+        toast("error","Receipt total failed: " + await resp.text());
+        return;
+      }
+
+      // store last receipt summary
+      lastReceiptAmount = receiptSum;
+      lastReceiptCount = receiptCount;
+      lastReceiptDate = dateEl.value;
+
+      // optional: store vendor name for nice display
+      lastReceiptVendor = vendorSelect.selectedOptions[0]?.textContent || null;
+
+      updateLastReceiptUI();
+
+
+      // start a new receipt session
+      resetReceiptSession();
+      refresh();
+    };
+
+    // ------- initial load -------
+    dateEl.value = new Date().toISOString().slice(0,10);
+    updateReceiptUI();
+    updateLastReceiptUI();
+
+    // load dropdowns then list
+    (async () => {
+      await loadPaymentTypes();
+      await loadVendors();
+      await refresh();
+    })();
+  </script>
+</body>
+</html>
