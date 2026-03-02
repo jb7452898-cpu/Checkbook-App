@@ -856,7 +856,10 @@ def export_csv():
                 )
                 con.commit()
 
-    filename = f"checkbook_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    #  old filename this works but im trying something new
+    #filename = f"checkbook_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    filename = f"checkbook_export_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
+
     return Response(
         csv_text,
         mimetype="text/csv",
