@@ -108,6 +108,51 @@
       color: #8fd3ff;
     }
 
+    #floatBar {
+      position: fixed;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      max-width: 900px;
+      margin: 0 auto;
+
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+
+      padding: 10px 12px;
+      border-radius: 16px;
+      border: 1px solid rgba(143, 211, 255, 0.7);
+      background: rgba(17, 17, 17, 0.96);
+      backdrop-filter: blur(8px);
+
+      opacity: 0;
+      transform: translateY(10px);
+      pointer-events: none;
+      transition: opacity 180ms ease, transform 180ms ease;
+    }
+
+    #floatBar.show {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    .fb-left { min-width: 0; }
+    .fb-title { font-weight: 900; }
+    .fb-sub { font-size: 13px; opacity: 0.9; margin-top: 2px; }
+
+    .fb-right {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    /* Give the page bottom room so the bar doesn't cover last rows */
+    body { padding-bottom: 90px; }
+
   </style>
 </head>
 <body>
@@ -181,6 +226,20 @@
     <ul id="list"></ul>
   </div>
 
+  <div id="floatBar">
+  <div class="fb-left">
+    <div class="fb-title">Selected</div>
+    <div class="fb-sub" id="fbExport">Export: 0 — $0.00</div>
+    <div class="fb-sub" id="fbReceipt">Receipt: 0 — $0.00</div>
+  </div>
+
+  <div class="fb-right">
+    <button id="fbExportBtn">Export Selected (0)</button>
+    <button id="fbReceiptBtn">Total Receipt (0)</button>
+    <button id="fbClearBtn" title="Clear selections">Clear</button>
+  </div>
+</div>
+
   <script>
     const dateEl = document.getElementById("date");
     const amountEl = document.getElementById("amount");
@@ -215,6 +274,14 @@
 
     const exportSelectedIds = new Set();
     const receiptSelectedIds = new Set();
+
+    const floatBar = document.getElementById("floatBar");
+    const fbExport = document.getElementById("fbExport");
+    const fbReceipt = document.getElementById("fbReceipt");
+
+    const fbExportBtn = document.getElementById("fbExportBtn");
+    const fbReceiptBtn = document.getElementById("fbReceiptBtn");
+    const fbClearBtn = document.getElementById("fbClearBtn");
 
     exportSelectedBtn.onclick = async (e) => {
       e.preventDefault();
@@ -253,7 +320,7 @@
 
       toast("ok", `Exported ${ids.length} rows.`);
       exportSelectedIds.clear();
-      updateSelectionButtons();
+      updateSelectionUI();
       refresh();
     };
 
@@ -280,13 +347,43 @@
       const out = await resp.json();
       toast("ok", `Created receipt total for ${ids.length} items.`);
       receiptSelectedIds.clear();
-      updateSelectionButtons();
+      updateSelectionUI();
       refresh();
     };
 
-    function updateSelectionButtons() {
-      exportSelectedBtn.textContent = `Export Selected (${exportSelectedIds.size})`;
-      receiptSelectedBtn.textContent = `Total Selected as Receipt (${receiptSelectedIds.size})`;
+    function sumFor(idsSet) {
+      let sum = 0;
+      for (const id of idsSet) {
+        const t = txnById.get(id);
+        if (!t) continue;
+        const n = Number(t.amount);
+        if (Number.isFinite(n)) sum += n;
+      }
+      return sum;
+    }
+
+    function updateSelectionUI() {
+      // If floating bar elements aren't on the page, don't crash rendering.
+      if (!floatBar || !fbExport || !fbReceipt || !fbExportBtn || !fbReceiptBtn) return;
+
+
+      const exportCount = exportSelectedIds.size;
+      const receiptCount = receiptSelectedIds.size;
+
+      const exportSum = sumFor(exportSelectedIds);
+      const receiptSum = sumFor(receiptSelectedIds);
+
+      // Button labels (floating bar)
+      fbExportBtn.textContent = `Export Selected (${exportCount})`;
+      fbReceiptBtn.textContent = `Total Receipt (${receiptCount})`;
+
+      // Summary text
+      fbExport.textContent = `Export: ${exportCount} — $${fmt2(exportSum)}`;
+      fbReceipt.textContent = `Receipt: ${receiptCount} — $${fmt2(receiptSum)}`;
+
+      // Show/hide bar
+      const shouldShow = (exportCount + receiptCount) > 0;
+      floatBar.classList.toggle("show", shouldShow);
     }
 
     function fmt2(x) { return Number(x).toFixed(2); }
@@ -339,6 +436,9 @@
     let lastReceiptCount = null;
     let lastReceiptDate = null;
     let lastReceiptVendor = null;
+
+
+    let txnById = new Map(); // refreshed each refresh()
 
     function updateLastReceiptUI() {
       if (!lastReceiptEl) return;
@@ -406,8 +506,15 @@
     }
 
     async function refresh() {
-      const res = await fetch("/api/txns");
+       try {
+        const res = await fetch("/api/txns");
       const data = await res.json();
+
+    // DEBUG sanity
+    console.log("txns:", data.txns?.length, "total:", data.total);
+
+      txnById = new Map();
+      for (const t of data.txns) txnById.set(t.id, t);
 
       if (data.username) titleEl.textContent = "Checkbook for " + data.username;
       totalEl.textContent = "Total: " + fmt2(data.total);
@@ -417,6 +524,11 @@
 
       for (const t of data.txns) {
         const li = document.createElement("li");
+
+        if (exportSelectedIds.has(t.id) || receiptSelectedIds.has(t.id)) {
+          li.style.background = "rgba(143, 211, 255, 0.06)";
+        }
+
         li.className = "txn";
         if (t.is_receipt_total) li.classList.add("txn-total");
 
@@ -459,23 +571,38 @@
         const exportCb = document.createElement("input");
         exportCb.type = "checkbox";
         exportCb.title = "Select for export";
+
+        // preserve checked state on refresh
         exportCb.checked = exportSelectedIds.has(t.id);
+
         exportCb.onchange = () => {
-          if (exportCb.checked) exportSelectedIds.add(t.id);
-          else exportSelectedIds.delete(t.id);
-          updateSelectionButtons();
+          if (exportCb.checked) {
+            exportSelectedIds.add(t.id);
+          } else {
+            exportSelectedIds.delete(t.id);
+          }
+          updateSelectionUI();
         };
 
-        // --- Receipt checkbox (disable on TOTAL rows) ---
+
+        // --- Receipt checkbox ---
         const receiptCb = document.createElement("input");
         receiptCb.type = "checkbox";
         receiptCb.title = "Select for receipt total";
+
+        // disable on TOTAL rows (you never want to total a total)
         receiptCb.disabled = !!t.is_receipt_total;
+
+        // preserve checked state
         receiptCb.checked = receiptSelectedIds.has(t.id);
+
         receiptCb.onchange = () => {
-          if (receiptCb.checked) receiptSelectedIds.add(t.id);
-          else receiptSelectedIds.delete(t.id);
-          updateSelectionButtons();
+          if (receiptCb.checked) {
+            receiptSelectedIds.add(t.id);
+          } else {
+            receiptSelectedIds.delete(t.id);
+          }
+          updateSelectionUI();
         };
 
 
@@ -499,7 +626,15 @@
       }
 
       listEl.appendChild(frag);
-    }
+
+    // If you added floating UI, call it LAST, but don't let it crash the list
+    try { updateSelectionUI?.(); } catch (e) { console.error("updateSelectionUI crashed:", e); }
+
+  } catch (err) {
+    console.error("REFRESH CRASHED:", err);
+    toast("error", "Refresh crashed: " + err.message);
+  }
+}
 
     // -------- create helpers ----------
     async function createPaymentType(name) {
@@ -714,7 +849,7 @@
     dateEl.value = new Date().toISOString().slice(0,10);
     updateReceiptUI();
     updateLastReceiptUI();
-    updateSelectionButtons();
+    updateSelectionUI();
 
     // load dropdowns then list
     (async () => {
