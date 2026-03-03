@@ -10,6 +10,8 @@ import psycopg
 from flask import Flask, request, jsonify, render_template, redirect, url_for, session, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 
+from uuid import uuid4
+
 app = Flask(__name__)
 
 # --- Config ---
@@ -583,7 +585,15 @@ def list_txns():
             "exported_at": r["exported_at"],
         } for r in rows]
 
-    total = str(sum(Decimal(t["amount"]) for t in txns)) if txns else "0.00"
+    # If a receipt has a TOTAL row, count ONLY the total row for that receipt.
+    receipt_ids_with_total = {t["receipt_id"] for t in txns if t["is_receipt_total"]}
+
+    def counts_toward_total(t):
+        if t["receipt_id"] in receipt_ids_with_total:
+            return t["is_receipt_total"]
+        return True
+
+    total = str(sum(Decimal(t["amount"]) for t in txns if counts_toward_total(t))) if txns else "0.00"
     return jsonify({"username": session.get("username"), "txns": txns, "total": total})
 
 @app.post("/api/txns")
@@ -866,6 +876,158 @@ def export_csv():
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
+@app.post("/export_selected.csv")
+@require_login
+def export_selected_csv():
+    user_id = int(session["user_id"])
+    data = request.get_json(force=True)
+    ids = data.get("ids") or []
+
+    # sanitize
+    try:
+        ids = [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return ("Invalid ids", 400)
+
+    if not ids:
+        return ("No rows selected", 400)
+
+    export_time = utc_now_iso()
+
+    header = [
+        "id",
+        "date",
+        "payment_type",
+        "vendor",
+        "item",
+        "amount",
+        "memo",
+        "receipt_id",
+        "is_receipt_total",
+        "exported_at",
+    ]
+
+    if using_postgres():
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                      t.id,
+                      t.txn_date,
+                      pt.name AS payment_type,
+                      v.name AS vendor,
+                      COALESCE(vi.name, 'TOTAL') AS item,
+                      t.amount,
+                      t.memo,
+                      t.receipt_id,
+                      t.is_receipt_total
+                    FROM transactions t
+                    JOIN payment_types pt ON pt.id = t.payment_type_id
+                    JOIN vendors v ON v.id = t.vendor_id
+                    LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
+                    WHERE t.user_id=%s AND t.id = ANY(%s)
+                    ORDER BY t.txn_date ASC, t.id ASC
+                    """,
+                    (user_id, ids),
+                )
+                rows = cur.fetchall()
+
+                if not rows:
+                    return ("No matching rows", 404)
+
+                # mark exported_at for ALL selected rows (even if already exported)
+                cur.execute(
+                    "UPDATE transactions SET exported_at=%s WHERE user_id=%s AND id = ANY(%s)",
+                    (export_time, user_id, ids),
+                )
+            conn.commit()
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=header)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({
+                "id": int(r[0]),
+                "date": r[1].isoformat(),
+                "payment_type": r[2],
+                "vendor": r[3],
+                "item": r[4],
+                "amount": str(r[5]),
+                "memo": r[6],
+                "receipt_id": r[7],
+                "is_receipt_total": bool(r[8]),
+                "exported_at": export_time,
+            })
+        csv_text = buf.getvalue()
+
+    else:
+        with sqlite3.connect(SQLITE_PATH) as con:
+            con.execute("PRAGMA foreign_keys = ON;")
+            con.row_factory = sqlite3.Row
+
+            placeholders = ",".join("?" for _ in ids)
+            rows = con.execute(
+                f"""
+                SELECT
+                  t.id,
+                  t.txn_date AS date,
+                  pt.name AS payment_type,
+                  v.name AS vendor,
+                  COALESCE(vi.name, 'TOTAL') AS item,
+                  t.amount,
+                  t.memo,
+                  t.receipt_id,
+                  t.is_receipt_total
+                FROM transactions t
+                JOIN payment_types pt ON pt.id = t.payment_type_id
+                JOIN vendors v ON v.id = t.vendor_id
+                LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
+                WHERE t.user_id=? AND t.id IN ({placeholders})
+                ORDER BY t.txn_date ASC, t.id ASC
+                """,
+                (user_id, *ids),
+            ).fetchall()
+
+            if not rows:
+                return ("No matching rows", 404)
+
+            con.execute(
+                f"UPDATE transactions SET exported_at=? WHERE user_id=? AND id IN ({placeholders})",
+                (export_time, user_id, *ids),
+            )
+            con.commit()
+
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=header)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({
+                    "id": int(r["id"]),
+                    "date": r["date"],
+                    "payment_type": r["payment_type"],
+                    "vendor": r["vendor"],
+                    "item": r["item"],
+                    "amount": r["amount"],
+                    "memo": r["memo"],
+                    "receipt_id": r["receipt_id"],
+                    "is_receipt_total": bool(r["is_receipt_total"]),
+                    "exported_at": export_time,
+                })
+            csv_text = buf.getvalue()
+
+    filename = f"checkbook_selected_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
 @app.post("/api/receipt_total")
 @require_login
 def add_receipt_total():
@@ -924,6 +1086,128 @@ def add_receipt_total():
             )
             con.commit()
             return jsonify({"ok": True, "id": int(cur.lastrowid)})
+
+
+@app.post("/api/receipt_total_selected")
+@require_login
+def receipt_total_selected():
+    user_id = int(session["user_id"])
+    data = request.get_json(force=True)
+    ids = data.get("ids") or []
+
+    try:
+        ids = [int(x) for x in ids]
+    except (TypeError, ValueError):
+        return ("Invalid ids", 400)
+
+    if not ids:
+        return ("No rows selected", 400)
+
+    new_receipt_id = "r_" + uuid4().hex[:12]
+
+    if using_postgres():
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                # lock rows so double-clicks don't create two totals
+                cur.execute(
+                    """
+                    SELECT id, txn_date, payment_type_id, vendor_id, amount, is_receipt_total
+                    FROM transactions
+                    WHERE user_id=%s AND id = ANY(%s)
+                    FOR UPDATE
+                    """,
+                    (user_id, ids),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return ("No matching rows", 404)
+
+                # must be non-total rows only
+                if any(bool(r[5]) for r in rows):
+                    return ("Selection cannot include TOTAL rows.", 400)
+
+                txn_date = rows[0][1]
+                payment_type_id = rows[0][2]
+                vendor_id = rows[0][3]
+
+                # enforce same group
+                for r in rows:
+                    if r[1] != txn_date or r[2] != payment_type_id or r[3] != vendor_id:
+                        return ("Selected rows must share the same date, payment type, and vendor.", 400)
+
+                total_amt = sum(Decimal(str(r[4])) for r in rows).quantize(Decimal("0.01"))
+                memo = f"Receipt total (items: {len(rows)})"
+
+                # assign selected items to new receipt_id
+                cur.execute(
+                    "UPDATE transactions SET receipt_id=%s WHERE user_id=%s AND id = ANY(%s)",
+                    (new_receipt_id, user_id, ids),
+                )
+
+                # insert receipt total row
+                cur.execute(
+                    """
+                    INSERT INTO transactions(
+                      user_id, txn_date, payment_type_id, vendor_id, vendor_item_id,
+                      amount, memo, receipt_id, is_receipt_total
+                    )
+                    VALUES (%s,%s,%s,%s,NULL,%s,%s,%s,TRUE)
+                    RETURNING id
+                    """,
+                    (user_id, txn_date, payment_type_id, vendor_id, str(total_amt), memo, new_receipt_id),
+                )
+                new_id = cur.fetchone()[0]
+            conn.commit()
+        return jsonify({"ok": True, "id": int(new_id), "receipt_id": new_receipt_id})
+
+    else:
+        with sqlite3.connect(SQLITE_PATH) as con:
+            con.execute("PRAGMA foreign_keys = ON;")
+            con.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in ids)
+
+            rows = con.execute(
+                f"""
+                SELECT id, txn_date, payment_type_id, vendor_id, amount, is_receipt_total
+                FROM transactions
+                WHERE user_id=? AND id IN ({placeholders})
+                """,
+                (user_id, *ids),
+            ).fetchall()
+            if not rows:
+                return ("No matching rows", 404)
+
+            if any(bool(r["is_receipt_total"]) for r in rows):
+                return ("Selection cannot include TOTAL rows.", 400)
+
+            txn_date = rows[0]["txn_date"]
+            payment_type_id = rows[0]["payment_type_id"]
+            vendor_id = rows[0]["vendor_id"]
+
+            for r in rows:
+                if r["txn_date"] != txn_date or r["payment_type_id"] != payment_type_id or r["vendor_id"] != vendor_id:
+                    return ("Selected rows must share the same date, payment type, and vendor.", 400)
+
+            total_amt = sum(Decimal(str(r["amount"])) for r in rows).quantize(Decimal("0.01"))
+            memo = f"Receipt total (items: {len(rows)})"
+
+            con.execute(
+                f"UPDATE transactions SET receipt_id=? WHERE user_id=? AND id IN ({placeholders})",
+                (new_receipt_id, user_id, *ids),
+            )
+            cur = con.cursor()
+            cur.execute(
+                """
+                INSERT INTO transactions(
+                  user_id, txn_date, payment_type_id, vendor_id, vendor_item_id,
+                  amount, memo, receipt_id, is_receipt_total
+                )
+                VALUES (?,?,?,?,NULL,?,?,?,1)
+                """,
+                (user_id, txn_date, payment_type_id, vendor_id, str(total_amt), memo, new_receipt_id),
+            )
+            con.commit()
+            return jsonify({"ok": True, "id": int(cur.lastrowid), "receipt_id": new_receipt_id})
 
 if __name__ == "__main__":
     init_db()

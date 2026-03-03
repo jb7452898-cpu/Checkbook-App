@@ -164,6 +164,11 @@
       <a href="/export.csv?all=1" title="Exports everything (does not mark exported)">Export all CSV</a>
     </div>
 
+    <div class="minirow" style="margin-top: 10px;">
+      <button id="exportSelectedBtn">Export Selected (0)</button>
+      <button id="receiptSelectedBtn">Total Selected as Receipt (0)</button>
+    </div>
+
     <div id="msg" class="err"></div>
   </div>
 
@@ -204,6 +209,85 @@
     const receiptTotalBtn = document.getElementById("receiptTotal");
 
     const lastReceiptEl = document.getElementById("lastReceipt");
+
+    const exportSelectedBtn = document.getElementById("exportSelectedBtn");
+    const receiptSelectedBtn = document.getElementById("receiptSelectedBtn");
+
+    const exportSelectedIds = new Set();
+    const receiptSelectedIds = new Set();
+
+    exportSelectedBtn.onclick = async (e) => {
+      e.preventDefault();
+      if (exportSelectedIds.size === 0) {
+        toast("ok", "No rows selected for export.");
+        return;
+      }
+
+      const ids = Array.from(exportSelectedIds);
+
+      const resp = await fetch("/export_selected.csv", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+
+      if (!resp.ok) {
+        toast("error", "Export failed: " + await resp.text());
+        return;
+      }
+
+      // download response as a file
+      const blob = await resp.blob();
+      const cd = resp.headers.get("Content-Disposition") || "";
+      const match = cd.match(/filename="([^"]+)"/);
+      const filename = match ? match[1] : "checkbook_selected.csv";
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      toast("ok", `Exported ${ids.length} rows.`);
+      exportSelectedIds.clear();
+      updateSelectionButtons();
+      refresh();
+    };
+
+    receiptSelectedBtn.onclick = async (e) => {
+      e.preventDefault();
+      if (receiptSelectedIds.size === 0) {
+        toast("ok", "No rows selected for receipt total.");
+        return;
+      }
+
+      const ids = Array.from(receiptSelectedIds);
+
+      const resp = await fetch("/api/receipt_total_selected", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+
+      if (!resp.ok) {
+        toast("error", "Receipt total failed: " + await resp.text());
+        return;
+      }
+
+      const out = await resp.json();
+      toast("ok", `Created receipt total for ${ids.length} items.`);
+      receiptSelectedIds.clear();
+      updateSelectionButtons();
+      refresh();
+    };
+
+    function updateSelectionButtons() {
+      exportSelectedBtn.textContent = `Export Selected (${exportSelectedIds.size})`;
+      receiptSelectedBtn.textContent = `Total Selected as Receipt (${receiptSelectedIds.size})`;
+    }
 
     function fmt2(x) { return Number(x).toFixed(2); }
 
@@ -371,6 +455,30 @@
         if (Number.isFinite(n)) amt.classList.add(n < 0 ? "amount-neg" : "amount-pos");
         amt.textContent = `$${fmt2(t.amount)}`;
 
+        // --- Export checkbox ---
+        const exportCb = document.createElement("input");
+        exportCb.type = "checkbox";
+        exportCb.title = "Select for export";
+        exportCb.checked = exportSelectedIds.has(t.id);
+        exportCb.onchange = () => {
+          if (exportCb.checked) exportSelectedIds.add(t.id);
+          else exportSelectedIds.delete(t.id);
+          updateSelectionButtons();
+        };
+
+        // --- Receipt checkbox (disable on TOTAL rows) ---
+        const receiptCb = document.createElement("input");
+        receiptCb.type = "checkbox";
+        receiptCb.title = "Select for receipt total";
+        receiptCb.disabled = !!t.is_receipt_total;
+        receiptCb.checked = receiptSelectedIds.has(t.id);
+        receiptCb.onchange = () => {
+          if (receiptCb.checked) receiptSelectedIds.add(t.id);
+          else receiptSelectedIds.delete(t.id);
+          updateSelectionButtons();
+        };
+
+
         const delBtn = document.createElement("button");
         delBtn.textContent = "Delete";
         delBtn.onclick = async () => {
@@ -380,6 +488,8 @@
           refresh();
         };
 
+        right.appendChild(exportCb);
+        right.appendChild(receiptCb);
         right.appendChild(amt);
         right.appendChild(delBtn);
 
@@ -604,6 +714,7 @@
     dateEl.value = new Date().toISOString().slice(0,10);
     updateReceiptUI();
     updateLastReceiptUI();
+    updateSelectionButtons();
 
     // load dropdowns then list
     (async () => {
