@@ -19,7 +19,12 @@ SQLITE_PATH = os.path.join(os.path.dirname(__file__), "checkbook.db")
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Render Postgres URL in prod
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 app.permanent_session_lifetime = 60 * 60 * 24 * 30  # ~30 days
+#SYNC_API_KEY = os.environ.get("SYNC_API_KEY")
+SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "dev-sync-key")
 
+def require_api_key():
+    supplied = request.headers.get("X-API-Key", "") or request.args.get("api_key", "")
+    return bool(SYNC_API_KEY) and supplied == SYNC_API_KEY
 
 def using_postgres() -> bool:
     return bool(DATABASE_URL)
@@ -1208,6 +1213,159 @@ def receipt_total_selected():
             )
             con.commit()
             return jsonify({"ok": True, "id": int(cur.lastrowid), "receipt_id": new_receipt_id})
+
+
+@app.get("/api/sync_export.csv")
+def sync_export_csv():
+    if not require_api_key():
+        return ("Unauthorized", 401)
+
+    username = normalize_username(request.args.get("username", ""))
+    if not username:
+        return ("Missing username", 400)
+
+    row = get_user_by_username(username)
+    if row is None:
+        return ("Unknown user", 404)
+
+    user_id = int(row[0])
+    export_time = utc_now_iso()
+
+    header = [
+        "id",
+        "date",
+        "payment_type",
+        "vendor",
+        "item",
+        "amount",
+        "note",
+        "receipt_id",
+        "is_receipt_total",
+        "exported_at",
+    ]
+
+    if using_postgres():
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                      t.id,
+                      t.txn_date,
+                      pt.name AS payment_type,
+                      v.name AS vendor,
+                      COALESCE(vi.name, 'TOTAL') AS item,
+                      t.amount,
+                      t.memo,
+                      t.receipt_id,
+                      t.is_receipt_total
+                    FROM transactions t
+                    JOIN payment_types pt ON pt.id = t.payment_type_id
+                    JOIN vendors v ON v.id = t.vendor_id
+                    LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
+                    WHERE t.user_id=%s AND t.exported_at IS NULL
+                    ORDER BY t.txn_date ASC, t.id ASC
+                    """,
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+
+                export_ids = [int(r[0]) for r in rows]
+
+                if export_ids:
+                    cur.execute(
+                        "UPDATE transactions SET exported_at=%s WHERE user_id=%s AND id = ANY(%s)",
+                        (export_time, user_id, export_ids),
+                    )
+            conn.commit()
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=header)
+        writer.writeheader()
+
+        for r in rows:
+            writer.writerow({
+                "id": int(r[0]),
+                "date": r[1].isoformat(),
+                "payment_type": r[2],
+                "vendor": r[3],
+                "item": r[4],
+                "amount": str(r[5]),
+                "note": r[6],
+                "receipt_id": r[7],
+                "is_receipt_total": bool(r[8]),
+                "exported_at": export_time,
+            })
+
+        csv_text = buf.getvalue()
+
+    else:
+        with sqlite3.connect(SQLITE_PATH) as con:
+            con.execute("PRAGMA foreign_keys = ON;")
+            con.row_factory = sqlite3.Row
+
+            rows = con.execute(
+                """
+                SELECT
+                  t.id,
+                  t.txn_date AS date,
+                  pt.name AS payment_type,
+                  v.name AS vendor,
+                  COALESCE(vi.name, 'TOTAL') AS item,
+                  t.amount,
+                  t.memo,
+                  t.receipt_id,
+                  t.is_receipt_total
+                FROM transactions t
+                JOIN payment_types pt ON pt.id = t.payment_type_id
+                JOIN vendors v ON v.id = t.vendor_id
+                LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
+                WHERE t.user_id=? AND t.exported_at IS NULL
+                ORDER BY t.txn_date ASC, t.id ASC
+                """,
+                (user_id,),
+            ).fetchall()
+
+            export_ids = [int(r["id"]) for r in rows]
+
+            if export_ids:
+                placeholders = ",".join("?" for _ in export_ids)
+                con.execute(
+                    f"UPDATE transactions SET exported_at=? WHERE user_id=? AND id IN ({placeholders})",
+                    (export_time, user_id, *export_ids),
+                )
+                con.commit()
+
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=header)
+            writer.writeheader()
+
+            for r in rows:
+                writer.writerow({
+                    "id": int(r["id"]),
+                    "date": r["date"],
+                    "payment_type": r["payment_type"],
+                    "vendor": r["vendor"],
+                    "item": r["item"],
+                    "amount": r["amount"],
+                    "note": r["memo"],
+                    "receipt_id": r["receipt_id"],
+                    "is_receipt_total": bool(r["is_receipt_total"]),
+                    "exported_at": export_time,
+                })
+
+            csv_text = buf.getvalue()
+
+    filename = f"checkbook_sync_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.csv"
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 if __name__ == "__main__":
     init_db()
