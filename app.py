@@ -1233,6 +1233,16 @@ def sync_export_csv():
 
     export_all = request.args.get("all", "0") == "1"
 
+    after_id_raw = (request.args.get("after_id", "") or "").strip()
+    after_id = None
+    if after_id_raw:
+        try:
+            after_id = int(after_id_raw)
+            if after_id < 0:
+                return ("Invalid after_id", 400)
+        except ValueError:
+            return ("Invalid after_id", 400)
+
     limit_raw = (request.args.get("limit", "") or "").strip()
     limit = None
     if limit_raw:
@@ -1242,6 +1252,9 @@ def sync_export_csv():
                 return ("Invalid limit", 400)
         except ValueError:
             return ("Invalid limit", 400)
+
+    if export_all and after_id is not None:
+        return ("Use either all=1 or after_id, not both", 400)
 
     header = [
         "id",
@@ -1256,10 +1269,15 @@ def sync_export_csv():
         "exported_at",
     ]
 
+    # mode:
+    # 1) after_id => deterministic sync slice, do NOT mark exported
+    # 2) all=1    => full dump, do NOT mark exported
+    # 3) default  => unexported only, DO mark exported
+
     if using_postgres():
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                if export_all:
+                if after_id is not None:
                     sql = """
                         SELECT
                           t.id,
@@ -1270,15 +1288,39 @@ def sync_export_csv():
                           t.amount,
                           t.memo,
                           t.receipt_id,
-                          t.is_receipt_total
+                          t.is_receipt_total,
+                          t.exported_at
+                        FROM transactions t
+                        JOIN payment_types pt ON pt.id = t.payment_type_id
+                        JOIN vendors v ON v.id = t.vendor_id
+                        LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
+                        WHERE t.user_id=%s AND t.id > %s
+                        ORDER BY t.id ASC
+                    """
+                    params = [user_id, after_id]
+
+                elif export_all:
+                    sql = """
+                        SELECT
+                          t.id,
+                          t.txn_date,
+                          pt.name AS payment_type,
+                          v.name AS vendor,
+                          COALESCE(vi.name, 'TOTAL') AS item,
+                          t.amount,
+                          t.memo,
+                          t.receipt_id,
+                          t.is_receipt_total,
+                          t.exported_at
                         FROM transactions t
                         JOIN payment_types pt ON pt.id = t.payment_type_id
                         JOIN vendors v ON v.id = t.vendor_id
                         LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
                         WHERE t.user_id=%s
-                        ORDER BY t.txn_date ASC, t.id ASC
+                        ORDER BY t.id ASC
                     """
                     params = [user_id]
+
                 else:
                     sql = """
                         SELECT
@@ -1290,13 +1332,14 @@ def sync_export_csv():
                           t.amount,
                           t.memo,
                           t.receipt_id,
-                          t.is_receipt_total
+                          t.is_receipt_total,
+                          t.exported_at
                         FROM transactions t
                         JOIN payment_types pt ON pt.id = t.payment_type_id
                         JOIN vendors v ON v.id = t.vendor_id
                         LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
                         WHERE t.user_id=%s AND t.exported_at IS NULL
-                        ORDER BY t.txn_date ASC, t.id ASC
+                        ORDER BY t.id ASC
                     """
                     params = [user_id]
 
@@ -1309,7 +1352,8 @@ def sync_export_csv():
 
                 export_ids = [int(r[0]) for r in rows]
 
-                if (not export_all) and export_ids:
+                # Only mark exported in default mode
+                if after_id is None and (not export_all) and export_ids:
                     cur.execute(
                         "UPDATE transactions SET exported_at=%s WHERE user_id=%s AND id = ANY(%s)",
                         (export_time, user_id, export_ids),
@@ -1321,6 +1365,7 @@ def sync_export_csv():
         writer.writeheader()
 
         for r in rows:
+            existing_exported_at = r[9].isoformat() if r[9] else ""
             writer.writerow({
                 "id": int(r[0]),
                 "date": r[1].isoformat(),
@@ -1331,7 +1376,7 @@ def sync_export_csv():
                 "memo": r[6],
                 "receipt_id": r[7],
                 "is_receipt_total": bool(r[8]),
-                "exported_at": export_time if not export_all else "",
+                "exported_at": export_time if (after_id is None and not export_all and export_ids) else existing_exported_at,
             })
 
         csv_text = buf.getvalue()
@@ -1341,7 +1386,7 @@ def sync_export_csv():
             con.execute("PRAGMA foreign_keys = ON;")
             con.row_factory = sqlite3.Row
 
-            if export_all:
+            if after_id is not None:
                 sql = """
                     SELECT
                       t.id,
@@ -1352,15 +1397,39 @@ def sync_export_csv():
                       t.amount,
                       t.memo,
                       t.receipt_id,
-                      t.is_receipt_total
+                      t.is_receipt_total,
+                      t.exported_at
+                    FROM transactions t
+                    JOIN payment_types pt ON pt.id = t.payment_type_id
+                    JOIN vendors v ON v.id = t.vendor_id
+                    LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
+                    WHERE t.user_id=? AND t.id > ?
+                    ORDER BY t.id ASC
+                """
+                params = [user_id, after_id]
+
+            elif export_all:
+                sql = """
+                    SELECT
+                      t.id,
+                      t.txn_date AS date,
+                      pt.name AS payment_type,
+                      v.name AS vendor,
+                      COALESCE(vi.name, 'TOTAL') AS item,
+                      t.amount,
+                      t.memo,
+                      t.receipt_id,
+                      t.is_receipt_total,
+                      t.exported_at
                     FROM transactions t
                     JOIN payment_types pt ON pt.id = t.payment_type_id
                     JOIN vendors v ON v.id = t.vendor_id
                     LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
                     WHERE t.user_id=?
-                    ORDER BY t.txn_date ASC, t.id ASC
+                    ORDER BY t.id ASC
                 """
                 params = [user_id]
+
             else:
                 sql = """
                     SELECT
@@ -1372,13 +1441,14 @@ def sync_export_csv():
                       t.amount,
                       t.memo,
                       t.receipt_id,
-                      t.is_receipt_total
+                      t.is_receipt_total,
+                      t.exported_at
                     FROM transactions t
                     JOIN payment_types pt ON pt.id = t.payment_type_id
                     JOIN vendors v ON v.id = t.vendor_id
                     LEFT JOIN vendor_items vi ON vi.id = t.vendor_item_id
                     WHERE t.user_id=? AND t.exported_at IS NULL
-                    ORDER BY t.txn_date ASC, t.id ASC
+                    ORDER BY t.id ASC
                 """
                 params = [user_id]
 
@@ -1387,10 +1457,9 @@ def sync_export_csv():
                 params.append(limit)
 
             rows = con.execute(sql, tuple(params)).fetchall()
-
             export_ids = [int(r["id"]) for r in rows]
 
-            if (not export_all) and export_ids:
+            if after_id is None and (not export_all) and export_ids:
                 placeholders = ",".join("?" for _ in export_ids)
                 con.execute(
                     f"UPDATE transactions SET exported_at=? WHERE user_id=? AND id IN ({placeholders})",
@@ -1403,6 +1472,7 @@ def sync_export_csv():
             writer.writeheader()
 
             for r in rows:
+                existing_exported_at = r["exported_at"] or ""
                 writer.writerow({
                     "id": int(r["id"]),
                     "date": r["date"],
@@ -1413,7 +1483,7 @@ def sync_export_csv():
                     "memo": r["memo"],
                     "receipt_id": r["receipt_id"],
                     "is_receipt_total": bool(r["is_receipt_total"]),
-                    "exported_at": export_time if not export_all else "",
+                    "exported_at": export_time if (after_id is None and not export_all and export_ids) else existing_exported_at,
                 })
 
             csv_text = buf.getvalue()
